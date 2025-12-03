@@ -7,3 +7,6 @@
 2. Run : `pip install streamlit pymupdf sentence-transformers scikit-learn ollama`.
 3. Run in the current directory terminal : `streamlit run app.py`.
 
+**Acknowledgement**
+I would like to acknowledge all the internet resources that I came across, that helped me to learn a lot via this project, including AI-platfoms like Claude and ChatGPT. I would thank my well-wishers for always motivating me.
+
