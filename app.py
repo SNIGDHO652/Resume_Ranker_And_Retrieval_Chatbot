@@ -21,13 +21,17 @@ except Exception:
     st.error("Missing `scikit-learn`. Install: pip install scikit-learn")
     raise
 
+try:
+    from thefuzz import fuzz
+except Exception:
+    st.error("Missing `thefuzz`. Install: pip install thefuzz[speedup]")
+    raise
 
 USE_OLLAMA = True
 try:
     from ollama import Client as OllamaClient
 except Exception:
     USE_OLLAMA = False
-
 
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 DEFAULT_CHUNK_TOKENS = 220
@@ -37,6 +41,36 @@ OLLAMA_MODEL = "llama3.2:1b"
 LLM_ATS_TOP_K = 6
 LLM_CHAT_TOP_K = 5
 
+CANONICAL_SECTIONS = {
+    "skills": [
+        "skills",
+        "technical skills",
+        "skill set",
+        "core skills",
+        "competencies",
+    ],
+    "experience": [
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment history",
+    ],
+    "education": [
+        "education",
+        "educational background",
+        "academic background",
+        "qualifications",
+    ],
+    "projects": [
+        "projects",
+        "personal projects",
+        "academic projects",
+        "selected projects",
+    ],
+    "summary": ["summary", "profile", "professional summary", "about me", "overview"],
+}
+
+FUZZY_THRESHOLD = 65  
 
 def extract_text_from_pdf(uploaded_file) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -81,17 +115,11 @@ def extract_name(text: str) -> str:
             return ln
     return "Unknown Candidate"
 
-
 def token_chunk_text(
     text: str,
     chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
     overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
 ) -> List[str]:
-    """
-    Approximate token-based chunking by splitting on whitespace (words).
-    chunk_tokens = number of words per chunk
-    overlap_tokens = number of words overlapping between chunks
-    """
     tokens = text.split()
     if len(tokens) <= chunk_tokens:
         return [" ".join(tokens)]
@@ -100,13 +128,11 @@ def token_chunk_text(
     n = len(tokens)
     while start < n:
         end = min(start + chunk_tokens, n)
-        chunk = tokens[start:end]
-        chunks.append(" ".join(chunk))
+        chunks.append(" ".join(tokens[start:end]))
         if end >= n:
             break
         start = max(0, end - overlap_tokens)
     return chunks
-
 
 @st.cache_resource(show_spinner=False)
 def load_embedding_model(name=EMBED_MODEL_NAME):
@@ -114,7 +140,6 @@ def load_embedding_model(name=EMBED_MODEL_NAME):
 
 
 model = load_embedding_model()
-
 
 def build_rag_index(
     resumes: List[Tuple[str, str]], chunk_tokens: int, overlap_tokens: int, top_k: int
@@ -187,7 +212,6 @@ def retrieve_topk(
                 break
     return results
 
-
 def get_ollama_client():
     if not USE_OLLAMA:
         return None
@@ -226,6 +250,80 @@ def extract_ollama_content(resp) -> Optional[str]:
     except Exception:
         return None
 
+def best_heading_match(line: str) -> Optional[str]:
+    line_clean = re.sub(r"[:\-\–\—]+$", "", line.strip().lower())
+    best_score = 0
+    best_key = None
+    for key, variants in CANONICAL_SECTIONS.items():
+        for v in variants:
+            score = fuzz.token_set_ratio(line_clean, v.lower())
+            if score > best_score:
+                best_score = score
+                best_key = key
+    if best_score >= FUZZY_THRESHOLD:
+        return best_key
+    return None
+
+
+def extract_sections_with_fuzzy_matching(text: str) -> Dict[str, str]:
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    sections = {k: "" for k in CANONICAL_SECTIONS.keys()}
+    current = None
+    for ln in lines:
+        if not ln.strip():
+            continue
+        match = best_heading_match(ln)
+        if match:
+            current = match
+            continue
+        if current:
+            sections[current] += ln + "\n"
+    if all(not v.strip() for v in sections.values()):
+        sections["summary"] = text
+    for k in sections:
+        sections[k] = " ".join(sections[k].split()).strip()
+    return sections
+
+def semantic_similarity_pct(a: str, b: str) -> float:
+    if not a.strip() or not b.strip():
+        return 0.0
+    try:
+        emb_a = model.encode([a], convert_to_numpy=True)
+        emb_b = model.encode([b], convert_to_numpy=True)
+        sim = cosine_similarity(emb_a, emb_b)[0][0]  # -1..1
+        pct = max(0.0, min(1.0, (sim + 1) / 2.0)) * 100.0
+        return round(float(pct), 2)
+    except Exception:
+        return 0.0
+
+
+def token_overlap_pct(a: str, b: str) -> float:
+    a_tokens = set(re.findall(r"\b\w+\b", a.lower()))
+    b_tokens = set(re.findall(r"\b\w+\b", b.lower()))
+    if not a_tokens:
+        return 0.0
+    inter = len(a_tokens & b_tokens)
+    pct = 100.0 * inter / len(a_tokens)
+    return round(pct, 2)
+
+
+def section_match_scores(jd_text: str, resume_text: str) -> Dict[str, float]:
+    jd_sections = extract_sections_with_fuzzy_matching(jd_text)
+    resume_sections = extract_sections_with_fuzzy_matching(resume_text)
+    results = {}
+    for sec in CANONICAL_SECTIONS.keys():
+        jd_sec = (
+            jd_sections.get(sec, "") or jd_text
+        ) 
+        res_sec = resume_sections.get(sec, "") or resume_text 
+        sem = semantic_similarity_pct(jd_sec, res_sec)
+        tok = token_overlap_pct(jd_sec, res_sec)
+        final = round((sem + tok) / 2.0, 2)
+        results[sec] = final
+    vals = list(results.values())
+    results["overall"] = round(sum(vals) / max(1, len(vals)), 2)
+    return results
+
 
 ACTION_VERBS = {
     "led",
@@ -248,7 +346,6 @@ ACTION_VERBS = {
 def heuristic_ats(resume_text: str, jd_text: str) -> Dict:
     words = re.findall(r"[A-Za-z0-9\+#\.\-]+", resume_text.lower())
     num_words = len(words)
-    bullets = len(re.findall(r"^\s*[\-\•\*\u2022]", resume_text, flags=re.M))
     has_email = bool(
         re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", resume_text)
     )
@@ -258,9 +355,6 @@ def heuristic_ats(resume_text: str, jd_text: str) -> Dict:
         )
     )
     has_table = bool(re.search(r"\|.+\|", resume_text))
-    jd_tokens = set(re.findall(r"\b\w+\b", jd_text.lower()))
-    resume_tokens = set(words)
-    keyword_overlap = len(jd_tokens & resume_tokens) / max(1, len(jd_tokens))
     verb_hits = sum(
         1
         for v in ACTION_VERBS
@@ -282,24 +376,21 @@ def heuristic_ats(resume_text: str, jd_text: str) -> Dict:
         recs.append("Add detailed responsibilities and metrics.")
     if verb_hits < 2:
         recs.append("Use more action verbs (led, implemented, improved).")
-    score = 100
-    score -= int((1 - keyword_overlap) * 40)
+
+    section_scores = section_match_scores(jd_text, resume_text)
+
+    base = section_scores.get("overall", 0.0)
+    score = base
     if not has_email:
-        score -= 10
-    if not has_phone:
         score -= 8
+    if not has_phone:
+        score -= 6
     if has_table:
-        score -= 10
+        score -= 8
     if num_words < 150:
-        score -= 10
-    score = max(0, min(100, score))
-    section_scores = {
-        "skills": round(100.0 * keyword_overlap, 2),
-        "experience": round(min(100.0, verb_hits * 10.0), 2),
-        "education": 0.0,
-        "projects": 0.0,
-        "summary": 0.0,
-    }
+        score -= 6
+    score = max(0.0, min(100.0, round(score, 2)))
+
     return {
         "ats_score": score,
         "issues": issues,
@@ -318,7 +409,6 @@ def llm_evaluate_ats(
     client = cached_ollama_client()
     if client is None:
         return None
-
     retrieved = retrieve_topk(
         jd_text, rag_index, top_k=top_k, candidate_filter=candidate_name
     )
@@ -336,14 +426,10 @@ def llm_evaluate_ats(
 
     system = (
         "You are an assistant that evaluates a resume against a job description for ATS compatibility and section-wise match. "
-        "Output ONLY valid JSON with keys: "
-        "ats_score (0-100), issues (list), recommendations (list), "
-        "section_scores (object with skills, experience, education, projects, summary each 0-100), "
+        "Output ONLY valid JSON with keys: issues (list), recommendations (list), "
         "short_summary (1-3 sentence). No other text."
     )
-
     user_prompt = f"Job Description:\n{jd_text[:3000]}\n\nResume context for {candidate_name}:\n{context_text}\n\nTask: produce the JSON."
-
     try:
         resp = client.chat(
             model=OLLAMA_MODEL,
@@ -356,7 +442,6 @@ def llm_evaluate_ats(
         content = extract_ollama_content(resp)
         if not content:
             return None
-
         content_clean = content.strip()
         content_clean = re.sub(r"^```json\s*|\s*```$", "", content_clean, flags=re.I)
         first = content_clean.find("{")
@@ -364,9 +449,8 @@ def llm_evaluate_ats(
         if first != -1 and last != -1:
             content_clean = content_clean[first : last + 1]
         parsed = json.loads(content_clean)
-
-        parsed["ats_score"] = float(parsed.get("ats_score", 0.0))
-        ss = parsed.get("section_scores", {})
+        ss = section_match_scores(jd_text, resume_text)
+        parsed["ats_score"] = ss.get("overall", 0.0)
         for k in ["skills", "experience", "education", "projects", "summary"]:
             ss.setdefault(k, 0.0)
         parsed["section_scores"] = {
@@ -422,9 +506,8 @@ def extractive_answer(question: str, retrieved: List[Dict]) -> str:
         lines.append(f"{r['candidate_name']} ({r['score']:.3f}): {snippet}")
     return "Extractive results:\n" + "\n".join(lines)
 
-
-st.set_page_config(page_title="Resume Ranker_Insight Chatbot_ATS", layout="wide")
-st.title("📄 Resume Ranker + RAG Chatbot + ATS Insights")
+st.set_page_config(page_title="Resume_Ranker_Contextual_Chatbot_ATS", layout="wide")
+st.title("Resume Ranker + Contextual Chatbot & ATS")
 
 page = st.sidebar.radio(
     "Navigate", ["Upload", "Ranking", "Chatbot", "ATS Insights"], index=0
@@ -442,15 +525,10 @@ top_k_chat = st.sidebar.slider("Retriever top_k (chat)", 1, 12, DEFAULT_TOP_K)
 use_llm_for_ats = st.sidebar.checkbox("Use Ollama for ATS (if available)", value=True)
 show_debug = st.sidebar.checkbox("Show debug info", value=False)
 st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Tip: token-based chunking approximates LLM token windows. Increase chunk size if LLM supports larger context."
-)
+st.sidebar.caption("Fuzzy heading matching threshold: {}".format(FUZZY_THRESHOLD))
 
 if page == "Upload":
     st.header("Upload Job Description & Resumes")
-    st.info(
-        "Upload a Job Description (PDF/TXT) and multiple resumes (PDF). Then go to 'Ranking' to process."
-    )
     jd_file = st.file_uploader(
         "Job Description (PDF or TXT)", type=["pdf", "txt"], key="jd_upload"
     )
@@ -486,7 +564,6 @@ elif page == "Ranking":
     else:
         jd_text = st.session_state["jd_text"]
         resumes = st.session_state["resumes"]
-
         with st.expander("Job Description (preview)"):
             st.write(jd_text[:4000])
 
@@ -498,11 +575,13 @@ elif page == "Ranking":
                     emb = model.encode([txt], convert_to_numpy=True)
                     sem_sim = float(cosine_similarity(jd_emb, emb)[0][0])
                     name = extract_name(txt)
+                    sec_scores = section_match_scores(jd_text, txt)
                     scored.append(
                         {
                             "filename": fname,
                             "name": name,
                             "semantic_score": sem_sim,
+                            "section_scores": sec_scores,
                             "text": txt,
                         }
                     )
@@ -517,27 +596,23 @@ elif page == "Ranking":
                 )
                 st.session_state["rag_index"] = rag_index
             st.success(
-                "Ranking & RAG index built. Move to 'ATS Insights' to evaluate or 'Chatbot' to ask questions."
+                "Ranking & RAG index built. Move to 'ATS Insights' or 'Chatbot'."
             )
 
         if "semantic_scored" in st.session_state:
             st.subheader("Top semantic matches")
             for i, r in enumerate(st.session_state["semantic_scored"], start=1):
-                cols = st.columns([1, 1, 4])
+                cols = st.columns([1, 1, 4, 2])
                 cols[0].write(f"**{i}**")
                 cols[1].metric("Score", f"{r['semantic_score']:.3f}")
                 cols[2].markdown(f"**{r['name']}** — `{r['filename']}`")
-                with st.expander("Preview / actions"):
+                ssum = r.get("section_scores", {})
+                cols[3].write(f"Overall section match: {ssum.get('overall',0):.1f}%")
+                with st.expander("Preview / section scores"):
+                    st.markdown("**Section-wise scores (0-100%)**")
+                    st.json(r.get("section_scores", {}))
+                    st.markdown("Resume preview")
                     st.write(r["text"][:3000])
-                    if st.button(
-                        f"View ATS (quick) — {r['filename']}", key=f"quick_ats_{i}"
-                    ):
-                        st.session_state["_quick_preview"] = r
-
-            if "_quick_preview" in st.session_state:
-                r = st.session_state["_quick_preview"]
-                st.markdown("### Quick Preview")
-                st.code(r["text"][:2000])
 
 elif page == "Chatbot":
     st.header("RAG Chatbot — Ask about candidates")
@@ -582,10 +657,10 @@ elif page == "Chatbot":
                     with st.expander(
                         f"{r['candidate_name']} — {r['filename']} | score {r['score']:.3f}"
                     ):
-                        st.text(r["chunk_text"])
+                        st.text(r["chunk_text"][:1200])
 
 elif page == "ATS Insights":
-    st.header("ATS Insights — LLM-based (preferred) or heuristic fallback")
+    st.header("ATS Insights — LLM preferred, heuristic fallback")
     if "resumes" not in st.session_state or "jd_text" not in st.session_state:
         st.info(
             "Upload and save resumes on 'Upload' and build index on 'Ranking' first."
@@ -599,7 +674,7 @@ elif page == "ATS Insights":
             client_ok = (
                 use_llm_for_ats and USE_OLLAMA and (cached_ollama_client() is not None)
             )
-            with st.spinner("Evaluating... This may take a few seconds per resume"):
+            with st.spinner("Evaluating..."):
                 for fname, txt in resumes:
                     name = extract_name(txt)
                     llm_result = None
@@ -644,11 +719,13 @@ elif page == "ATS Insights":
         if "analyses" in st.session_state:
             st.subheader("ATS Results")
             for i, a in enumerate(st.session_state["analyses"], start=1):
-                card_cols = st.columns([1, 1, 2])
-                card_cols[0].metric("Rank", f"{i}")
-                card_cols[1].metric("Method", a["method"])
-                card_cols[2].markdown(f"**{a['name']}** — `{a['filename']}`")
+                cols = st.columns([1, 1, 2])
+                cols[0].metric("Rank", f"{i}")
+                cols[1].metric("ATS Score", f"{a['ats_score']:.1f}")
+                cols[2].markdown(f"**{a['name']}** — `{a['filename']}`")
                 with st.expander("Details & Recommendations"):
+                    st.markdown("**Section scores**")
+                    st.json(a.get("section_scores", {}))
                     st.markdown("**Issues**")
                     if a.get("issues"):
                         for it in a["issues"]:
@@ -684,6 +761,7 @@ if show_debug:
 
 st.markdown("---")
 st.caption(
-    "Built with Streamlit • Embeddings: sentence-transformers • Optional LLM: Ollama (local)."
+    "Built with Streamlit • Embeddings: sentence-transformers • Fuzzy headings via thefuzz • Optional LLM: Ollama (local)."
 )
+
 
