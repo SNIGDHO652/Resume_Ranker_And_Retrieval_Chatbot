@@ -1,4 +1,4 @@
-**Description** : This is the app to help recruiters rank resumes based on job description and get retrieved insights about the applicants.
+**Description** : This is the app to help recruiters rank resumes based on job description and get retrieved insights about the applicants with section-wise ATS scores.
 
 **Demo** : https://drive.google.com/file/d/1oZX-Pb-hKv2tAgsN-g5mxxZgji_qKcHn/view?usp=drive_link
 
