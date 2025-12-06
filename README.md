@@ -4,6 +4,6 @@
 
 **Instructions**
 1. Save `app.py` in a directory.
-2. Run : `pip install streamlit pymupdf sentence-transformers scikit-learn ollama`.
+2. Run : `pip install streamlit pymupdf sentence-transformers scikit-learn thefuzz ollama`.
 3. Run in the current directory terminal : `streamlit run app.py`.
 
